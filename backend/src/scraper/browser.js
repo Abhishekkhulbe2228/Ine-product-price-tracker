@@ -16,6 +16,7 @@ export async function launchBrowser(headless = true) {
   logger.info('BROWSER', `Launching browser (headless: ${headless})`);
 
   browserInstance = await chromium.launch({
+    channel: 'chromium',
     headless,
     args: [
       '--no-sandbox',
