@@ -9,6 +9,8 @@ import {
   insertScrapeLog,
 } from './history.service.js';
 
+let isScraping = false;
+
 /**
  * Run the scraper for all active tracked products.
  * This is the main orchestrator called by the cron and manual endpoints.
@@ -17,21 +19,32 @@ import {
  * @returns {Object} Summary of the scrape run
  */
 export async function runScraper(triggerType = 'manual') {
-  logger.info('SCRAPER', `Starting scrape run (trigger: ${triggerType})`);
-
-  // 1. Load active tracked products
-  const products = await getActiveTrackedProducts();
-
-  if (products.length === 0) {
-    logger.info('SCRAPER', 'No active tracked products to scrape');
+  if (isScraping) {
+    logger.warn('SCRAPER', `Scrape run already in progress, skipping trigger: ${triggerType}`);
     return {
-      success: true,
-      processed: 0,
-      successful: 0,
-      failed: 0,
+      success: false,
+      message: 'Scrape run already in progress',
       timestamp: new Date().toISOString(),
     };
   }
+
+  isScraping = true;
+  try {
+    logger.info('SCRAPER', `Starting scrape run (trigger: ${triggerType})`);
+
+    // 1. Load active tracked products
+    const products = await getActiveTrackedProducts();
+
+    if (products.length === 0) {
+      logger.info('SCRAPER', 'No active tracked products to scrape');
+      return {
+        success: true,
+        processed: 0,
+        successful: 0,
+        failed: 0,
+        timestamp: new Date().toISOString(),
+      };
+    }
 
   // 2. Create scrape run record
   const run = await createScrapeRun(triggerType);
@@ -96,24 +109,27 @@ export async function runScraper(triggerType = 'manual') {
     await closeBrowser();
   }
 
-  // 6. Complete the scrape run record
-  const status = failCount === products.length ? 'failed' : 'completed';
-  await completeScrapeRun(run.id, {
-    totalProducts: products.length,
-    successful: successCount,
-    failed: failCount,
-    status,
-  });
+    // 6. Complete the scrape run record
+    const status = failCount === products.length ? 'failed' : 'completed';
+    await completeScrapeRun(run.id, {
+      totalProducts: products.length,
+      successful: successCount,
+      failed: failCount,
+      status,
+    });
 
-  const summary = {
-    success: true,
-    processed: products.length,
-    successful: successCount,
-    failed: failCount,
-    runId: run.id,
-    timestamp: new Date().toISOString(),
-  };
+    const summary = {
+      success: true,
+      processed: products.length,
+      successful: successCount,
+      failed: failCount,
+      runId: run.id,
+      timestamp: new Date().toISOString(),
+    };
 
-  logger.info('SCRAPER', `Scrape run complete`, summary);
-  return summary;
+    logger.info('SCRAPER', `Scrape run complete`, summary);
+    return summary;
+  } finally {
+    isScraping = false;
+  }
 }

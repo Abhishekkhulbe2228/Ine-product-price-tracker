@@ -51,16 +51,56 @@ export async function scrapeProduct(trackedProduct, onAttempt) {
       const pageTitle = await page.textContent(SELECTORS.productTitle);
       logger.info('SCRAPE', `Page title: "${pageTitle}"`);
 
-      // Helper: dismiss cookie consent modal if it appears
+      // Helper: dismiss cookie consent modal if it appears (handles multi-click behavior)
       const dismissConsentIfPresent = async () => {
         try {
-          const consentBtn = await page.$(SELECTORS.consentAllowButton);
-          if (consentBtn) {
-            await consentBtn.click();
-            logger.info('SCRAPE', 'Dismissed cookie consent banner');
-            await page.waitForTimeout(200);
+          let scrim = await page.$(SELECTORS.consentScrim);
+          if (!scrim) return false;
+
+          let clicks = 0;
+          while (clicks < 4) {
+            const allowBtn = await page.$(SELECTORS.consentAllowButton);
+            if (!allowBtn) break;
+
+            await allowBtn.click({ timeout: 1000 }).catch(async () => {
+              // Fallback: direct evaluate click if pointer event was intercepted
+              await page.evaluate(() => {
+                const btn = document.querySelector('.consent-box button');
+                if (btn) btn.click();
+              });
+            });
+            clicks++;
+
+            // Wait for React to process state update or remove scrim
+            await page.waitForSelector(SELECTORS.consentScrim, { state: 'detached', timeout: 150 }).catch(() => {});
+            
+            scrim = await page.$(SELECTORS.consentScrim);
+            if (!scrim) break;
           }
-        } catch { /* ignore */ }
+
+          if (clicks > 0) {
+            logger.info('SCRAPE', `Dismissed cookie consent banner (${clicks} click(s))`);
+          }
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      // Helper: click an element safely, handling consent scrim interruptions without 15s timeout
+      const safeClick = async (element, timeoutMs = 3000) => {
+        await dismissConsentIfPresent();
+        try {
+          await element.click({ timeout: timeoutMs });
+        } catch (err) {
+          if (err.message && err.message.includes('consent-scrim')) {
+            logger.info('SCRAPE', 'Click intercepted by consent scrim; dismissing and retrying click...');
+            await dismissConsentIfPresent();
+            await element.click({ timeout: timeoutMs });
+          } else {
+            throw err;
+          }
+        }
       };
 
       await dismissConsentIfPresent();
@@ -77,12 +117,11 @@ export async function scrapeProduct(trackedProduct, onAttempt) {
           const cleanLabel = rawLabel.replace(/[\u200B-\u200D\uFEFF]/g, '').trim().toLowerCase();
           const targetLabel = selected_option_label.replace(/[\u200B-\u200D\uFEFF]/g, '').trim().toLowerCase();
           if (cleanLabel === targetLabel) {
-            await dismissConsentIfPresent();
-            await chip.click();
+            await safeClick(chip, 3000);
             optionFound = true;
             logger.info('SCRAPE', `Selected option: "${selected_option_label}"`);
-            // Brief wait for option selection to register
-            await page.waitForTimeout(300);
+            // Condition-based wait for option selection class to register
+            await page.waitForSelector(SELECTORS.optionChipSelected, { timeout: 1500 }).catch(() => {});
             break;
           }
         }
@@ -103,11 +142,10 @@ export async function scrapeProduct(trackedProduct, onAttempt) {
           const box = await offerPanel.boundingBox();
           if (box) {
             // Store's anti-bot requirement: >= 8 moves spaced >= 40ms, dwell >= 600ms
-            for (let i = 0; i < 12; i++) {
+            for (let i = 0; i < 10; i++) {
               await page.mouse.move(box.x + 20 + i * 15, box.y + 20 + (i % 3) * 10);
-              await page.waitForTimeout(60);
+              await page.waitForTimeout(45);
             }
-            await page.waitForTimeout(700);
           }
         }
       }
@@ -123,20 +161,57 @@ export async function scrapeProduct(trackedProduct, onAttempt) {
           throw new Error('Check price button not found and price not loaded');
         }
       } else {
+        // Wait for button to become enabled (condition-based wait replaces fixed 600ms sleep)
+        // The store checks dwell >= 600ms on a 250ms interval
+        await page.waitForFunction(
+          (btnSelector) => {
+            const btn = document.querySelector(btnSelector);
+            return btn && !btn.disabled;
+          },
+          SELECTORS.checkPriceButton,
+          { timeout: 2500 }
+        ).catch(() => {
+          logger.warn('SCRAPE', 'Button did not become enabled within condition timeout');
+        });
+
         const isDisabled = await page.evaluate(el => el.disabled, checkPriceBtn);
         if (isDisabled) {
-          logger.info('SCRAPE', 'Button still disabled, waiting briefly for unlock...');
-          await page.waitForTimeout(600);
+          throw new Error('Price loading failed: Offer button remained disabled');
         }
-        await checkPriceBtn.click();
+
+        await safeClick(checkPriceBtn, 3000);
         logger.info('SCRAPE', 'Clicked "Check today\'s price"');
       }
 
       // STAGE: PRICE_WAIT
-      // Wait for price to resolve (success or failure)
+      // Fast-fail if the store dropped the click (35% drop rate in mock store)
+      // When accepted, quote loading starts immediately (< 300ms). If dropped, button remains idle.
+      const quoteStarted = await Promise.race([
+        page.waitForSelector(
+          `${SELECTORS.offerLoading}, ${SELECTORS.offerReady}, ${SELECTORS.offerFailed}`,
+          { timeout: 3500 }
+        ).then(() => true).catch(() => false),
+        page.waitForFunction(
+          (btnSelector) => {
+            const btn = document.querySelector(btnSelector);
+            return !btn || btn.offsetParent === null;
+          },
+          SELECTORS.checkPriceButton,
+          { timeout: 3500 }
+        ).then(() => true).catch(() => false),
+      ]);
+
+      if (!quoteStarted) {
+        const alreadyResolved = await page.$(`${SELECTORS.offerReady}, ${SELECTORS.offerFailed}`);
+        if (!alreadyResolved) {
+          throw new Error('Price loading failed: Click dropped by store (quote pipeline did not start)');
+        }
+      }
+
+      // Quote pipeline started; wait for price to resolve (success or failure)
       await page.waitForSelector(
         `${SELECTORS.offerReady}, ${SELECTORS.offerFailed}`,
-        { timeout: 20000 }
+        { timeout: 15000 }
       );
 
       // Check if price loading failed
